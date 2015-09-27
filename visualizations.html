@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+  <!--This tool depends highly on the vis.js library. 
+  To access documentation for the vis.Timeline: visjs.org/docs/timeline/
+  for vis.Network: visjs.org/docs/network/
+  for vis.DataSet: visjs.org/docs/data/dataset -->
+
+  <script src="http://visjs.org/dist/vis.js"></script>
+  <link href="http://visjs.org/dist/vis.css" rel="stylesheet" type="text/css" />
+
+  <style type="text/css">
+    #selectedNetwork{
+      width: 1200px;
+      height: 1000px;
+      border: 1px solid lightgray;
+    }
+  </style>
+
+<p> First, attach dependencies file. </p>
+<input type="file" id="depinput" />
+
+<p> Next, attach taskflow log file. </p>
+<input type="file" id="loginput" /><br>
+
+<p> Timeline of nontrivial tasks, grouped by thread (double click for task description, single click for immediate dependencies, displayed below) </p>
+
+
+<div id="timelineVis">
+  <div class = "menu">
+    <input type="button" id="zoomIn" value="Zoom in"/>
+    <input type="button" id="zoomOut" value="Zoom out"/>
+    <input type="button" id="fit" value="Fit all items"/>
+    <input type="button" id="moveLeft" value="Move left"/>
+    <input type="button" id="moveRight" value="Move right"/>
+    <!--<div id="graphVis"> </div> <br>-->
+  </div>
+</div> <br>
+
+<p> Selected task dependencies (hover for task description) </p> <br>
+
+<button onclick="back()">Go back</button> <br>
+<button onclick="forward()">Go forward</button> <br>    
+<button id="zoomInNetwork">Zoom in</button> <br>
+<button id="fitNetwork">Fit</button> <br>
+
+<div id="selectedNetwork">
+  <!--menu somehow disappears when new dependencies graph is created-->
+  <!--<div class = "menu">
+    <button onclick="back()">Go back</button> <br>
+    <button onclick="forward()">Go forward</button> <br>
+    <button id="zoomInNetwork">Zoom in</button> <br>
+    <button id="fitNetwork">Fit</button> <br>
+  </div>-->
+</div> <br>
+
+<script type="text/javascript">
+
+  var eventsList = []; //updated each time a new dependencies graph is created through clicking on timeline or graph, allows user to move back and forward
+  var ptr = 0; //position within eventsList user is currently viewing
+  
+  //variables for parsing and creating timeline/graph
+  var threads = []; 
+  var threadNames = [];
+  var taskMap = new Map();
+  var items = new vis.DataSet({}); //contains nontrivial tasks, in the object form {id, thread, description, start, end}
+  var timeline;
+  var network;
+  var mainNode; //central node of the graph
+
+  function buildDep(evt) {
+    //parses the dependencies text file, builds a complete graph of all dependencies between tasks stored in "dependsOn" and "onDepends" of tasks
+
+    var f = evt.target.files[0];
+    if (!f) {
+      alert("Could not load file");
+      return 0;
+    } 
+    var r = new FileReader();
+    r.onload = function(e) {
+      var contents = e.target.result; 
+      var ct = r.result;
+      var lines = ct.split(/\r\n|\r|\n/g);
+      var cnt = 0;
+      for (var i = 0; i < lines.length; i+=1){
+        var labelSplit = lines[i].split(/\"/g);
+        if (labelSplit.length != 3){continue;}
+        var curLine = lines[i].match(/\S+/g);
+        var label = labelSplit[1];
+
+        //fixed issue with \n being two separate characters when reading from text file
+        var newline = label.search(/\\n/g);
+        if (newline != -1){
+          var newDesc = label.substring(0, newline) + "\n" + label.substring(newline+2);
+          label = newDesc;
+        }
+
+        //parsing for the taskNumber by splitting by " and removing label=[ in dependencies.txt
+        var taskNumber = labelSplit[0].substring(0, labelSplit[0].length-8).match(/\S+/g)[0];
+
+
+        var task = {
+          taskName: taskNumber,
+          taskDesc: label,
+          threadID: null,
+          startTime: null,
+          endTime: null,
+          dependsOn: [],
+          onDepends: []
+        };
+        taskMap.set(task.taskName, task);
+        cnt+=1;
+
+      }
+
+      var startTask = {
+        taskName: "START",
+        taskDesc: "START",
+        threadID: null,
+        startTime: null,
+        endTime: null,
+        dependsOn: [],
+        onDepends: []
+      };
+
+      var endTask = {
+        taskName: "END",
+        taskDesc: "END",
+        threadID: null,
+        startTime: null,
+        endTime: null,
+        dependsOn: [],
+        onDepends: []
+      };
+
+      taskMap.set("START", startTask);
+      taskMap.set("END", endTask);
+
+      for (var i = 0; i < lines.length; i+=1){
+        var curLine = lines[i].match(/\S+/g);
+        if (Object.prototype.toString.call(curLine) !== '[object Array]'){continue;}
+        if (curLine[1] == "->"){
+          if (!taskMap.has(curLine[0]) || !taskMap.has(curLine[2])) {
+            alert("Error in parsing file: could not find task");}
+          taskMap.get(curLine[0]).onDepends.push(curLine[2]);
+          taskMap.get(curLine[2]).dependsOn.push(curLine[0]);
+        }
+      }
+    }
+    
+    r.readAsText(f);
+  }
+
+
+
+  function parser(evt) {
+    //parses taskflow text file and updates taskMap with nontrivial task objects and generates the timeline
+    var f = evt.target.files[0];   
+    var r = new FileReader();
+    if (!f) {
+      alert("Could not load file");
+      return 0;
+    } 
+
+    r.onload = function (parserEvent){
+      var contents = parserEvent.target.result;             
+      var ct = r.result; 
+      var lines = ct.split(/\r\n|\r|\n/g);
+      var started = false;
+      var startingTime;
+
+      //adding all tasks to taskMap, setting the first task at time 0
+      for (var i = 0; i < lines.length; i+=1) {
+          var curLine = lines[i];
+          var lineArray = curLine.match(/\S+/g);
+          if (Object.prototype.toString.call(lineArray) !== '[object Array]' || lineArray.length != 5){continue;}
+
+          var sec = parseInt(lineArray[2]);
+          var usec = parseInt(lineArray[3]);
+          var time = sec + .000001*usec;
+
+          if (started != true){
+            startingTime = time - 86400*(Math.floor(time/86400)) - 104400; //date adjustment, not sure why this works - needs testing
+            started = true;
+          }
+          
+          
+
+          if(!taskMap.has(lineArray[0])) {alert("Could not find "+lineArray[0]);}
+          taskMap.get(lineArray[0]).threadID = lineArray[1];
+          if (lineArray[4] == 'START'){
+            taskMap.get(lineArray[0]).startTime = time - startingTime;
+          }
+          else {
+            taskMap.get(lineArray[0]).endTime = time - startingTime;          
+          }
+        }
+      
+
+      for(var value of taskMap.values()){
+        var thisThread = value.threadID;
+        if (threadNames.indexOf(thisThread) < 0){
+          threadNames.push(thisThread);
+        }
+      }
+
+      //create task arrays for all threads, stored in threads[]
+      for (var j = 0; j < threadNames.length; j+=1){
+        var threadArray = [];
+        for (var value of taskMap.values()){
+          if (threadNames[j] == value.threadID){
+            threadArray.push(value);
+          }
+        }
+        threads.push(threadArray);
+      }
+
+      //Timeline components printed to console - debugging purposes
+      /*for (var i = 0; i < threads.length; i+=1){
+        console.log("Thread: " + threadNames[i]);
+        for (var j = 0; j < threads[i].length; j+=1){
+          var thisTask = threads[i][j];
+          console.log("Task: " + thisTask.taskName + " " + thisTask.startEnd + " at time " + 
+            thisTask.timeSec + "." + thisTask.timeUsec);
+        }
+      }*/
+
+      //Create the timeline using only tasks that are longer than one millisecond; units of timeline are in milliseconds
+      var container = document.getElementById('timelineVis');
+      var groups = new vis.DataSet({});
+      for (var i = 0; i < threads.length; i+=1){
+        groups.add({id: i, content: i});
+      }
+      
+      for (var i = 0; i < threads.length; i+=1){
+        for (var j = 0; j < threads[i].length; j+=1){
+          var thisTask = threads[i][j];
+          if (1000*(thisTask.endTime - thisTask.startTime) > 1) {
+            items.add([{id: thisTask.taskName, 
+              group: i, 
+              content: thisTask.taskDesc, 
+              start: new Date(1000*(thisTask.startTime)), 
+              end: new Date(1000*(thisTask.endTime))}]);
+          }
+        }
+      }
+
+      var options = {
+        groupOrder: 'content', 
+        align: 'center', 
+        orientation: {axis: 'both'},
+        zoomable: false,
+        autoResize: true
+      };
+
+      timeline = new vis.Timeline(container, items, options);
+      timeline.setGroups(groups);
+
+      //not turning off select and doubleClick events aforehand can result in unusual timeline behavior
+      timeline.off('select', selected);
+      timeline.off('doubleClick', doubleclicked);
+      timeline.on('select', selected);
+      timeline.on('doubleClick', doubleclicked);
+
+      timeline.on('contextmenu', function (props) {
+        props.event.preventDefault();
+      });
+    }
+    r.readAsText(f);
+    //makeMemoryGraph();
+  }
+
+  var dataNet;
+
+  function selected(properties){
+    //selected() generates a new dependency graph if a task is clicked in timeline or graph
+
+    var taskFound;
+    mainNode = properties.items[0];
+    if(!taskMap.has(mainNode)) {alert("Error: could not find task "+mainNode);}
+    taskFound = taskMap.get(mainNode);
+
+    //moves the timeline to focus on a node if it is selected in the timeline or graph
+    var nodeIds = items.getIds();
+    for (var a = 0; a < nodeIds.length; a+=1){
+      if (nodeIds[a] == mainNode){
+        timeline.focus(mainNode);
+      }
+    }
+
+    //implementation of the back/forward functionality
+    if (eventsList.length == 0){
+      eventsList.push(properties);
+    }
+
+    /*if the user is viewing the latest selected dependency graph*/
+    else if (ptr == eventsList.length - 1 && properties != eventsList[ptr]){
+      eventsList.push(properties);
+      ptr+=1;
+    }
+
+    else{
+      /*if the user is not viewing the latest selected dependency graph and clicks on a task*/
+      if (eventsList[ptr] != properties){
+        while (eventsList.length != ptr + 1){
+          eventsList.pop();
+        }
+      
+        eventsList.push(properties);
+        ptr+=1;
+      } 
+    }
+
+
+    var container = document.getElementById("selectedNetwork");
+    var selectedEdges = new vis.DataSet({});
+    var selectedNodes = new vis.DataSet({});
+
+    selectedNodes.add({
+      id: mainNode, label: taskFound.taskDesc, title: taskFound.taskDesc
+    });
+
+    for (var i = 0; i < taskFound.dependsOn.length; i+=1){
+      var thisNode = {
+        id: taskFound.dependsOn[i], label: taskMap.get(taskFound.dependsOn[i]).taskDesc, title: taskMap.get(taskFound.dependsOn[i]).taskDesc
+      }
+      selectedNodes.add(thisNode);
+      var thisEdge = {
+        id: taskFound.dependsOn[i]+" "+taskFound.taskName, from: taskFound.dependsOn[i], 
+        to: taskFound.taskName, arrows: 'to'
+      }
+      selectedEdges.add(thisEdge);
+    }
+
+    for (var i = 0; i < taskFound.onDepends.length; i+=1){
+      var thisNode = {
+        id: taskFound.onDepends[i], label: taskMap.get(taskFound.onDepends[i]).taskDesc, title: taskMap.get(taskFound.onDepends[i]).taskDesc
+      }
+      selectedNodes.add(thisNode);
+      var thisEdge = {
+        id: taskFound.taskName+" "+taskFound.onDepends[i], from: taskFound.taskName, 
+        to: taskFound.onDepends[i], arrows: 'to'
+      }
+      selectedEdges.add(thisEdge);
+    }
+
+    var options = {
+      layout: {
+              hierarchical: {
+                  direction: "LR",
+                  levelSeparation: 400,
+                  sortMethod: "directed"
+                }
+            },
+      interaction:{
+        hover:true,
+        zoomView: false,
+        dragNodes: false,
+        dragView: true
+      },
+    };
+    dataNet = {
+      nodes: selectedNodes,
+      edges: selectedEdges
+    }
+    var network = new vis.Network(container, dataNet, options);
+
+    network.on("selectNode", function(params){
+      selected({items: params.nodes});
+    });
+    document.getElementById("zoomInNetwork").onclick = function(){
+      network.focus(mainNode, {scale: 3, locked: false});
+    };
+    document.getElementById("fitNetwork").onclick = function(){
+      network.fit();
+    }
+  }
+
+  /*function makeMemoryGraph () {
+    //potential improvement in functionality: include a graph of memory usage in the background of
+    //the timeline - not easily supported in the vis.js library
+
+    var container = document.getElementById('graphVis');
+    var items = [
+      {x: new Date(143707688439.2487), y: 10},
+      {x: new Date(143707688445.6629), y: 25},
+      {x: new Date(143707688475.0723), y: 30},
+      {x: new Date(143707688476.3450), y: 10},
+      {x: new Date(143707688477.6580), y: 15},
+      {x: new Date(143707688495.9611), y: 30}
+    ];
+
+    var dataset = new vis.DataSet(items);
+    var options = {
+      start: 143707688439.2487,
+      end: 143707688495.9611,
+      zoomable: false,
+      yAxisOrientation: 'right',
+      showMajorLines: false,
+      showMinorLines: false
+    };
+    var graph2d = new vis.Graph2d(container, dataset, options);
+  }*/
+
+  function doubleclicked(properties){
+    var thisTask = taskMap.get(properties.item);
+        alert("Task: " + thisTask.taskDesc + "\n" + 
+          "Duration: " + (items.get(properties.item).end - items.get(properties.item).start)/60000.0 + " minutes, or " + (items.get(properties.item).end - items.get(properties.item).start)/1000.0 + " seconds");
+  }
+
+
+
+function back(){ //see previous selected dependency graph
+  if (ptr > 0 && eventsList.length != 0){
+    ptr-=1;
+    selected(eventsList[ptr]);
+  }
+}
+
+function forward(){ //see next selected dependency graph
+  if (eventsList.length != 0 && ptr < eventsList.length - 1){
+    ptr+=1;
+    selected(eventsList[ptr]);
+   }
+}
+
+function zoom (percentage) { //zooms out by a proportion
+    var range = timeline.getWindow();
+    var interval = range.end - range.start;
+
+    timeline.setWindow({
+        start: range.start.valueOf() - interval * percentage,
+        end:   range.end.valueOf() + interval * percentage
+    });
+}
+
+function move (percentage) { //moves left by a proportion
+        var range = timeline.getWindow();
+        var interval = range.end - range.start;
+
+        timeline.setWindow({
+            start: range.start.valueOf() - interval * percentage,
+            end:   range.end.valueOf()   - interval * percentage
+        });
+    }
+
+document.getElementById('zoomIn').onclick    = function () { zoom(-0.2); };
+document.getElementById('zoomOut').onclick   = function () { zoom( 0.2); };
+document.getElementById('moveLeft').onclick  = function () { move( 0.2); };
+document.getElementById('moveRight').onclick = function () { move(-0.2); };
+document.getElementById('fit').onclick = function() {
+    timeline.fit();
+  };
+
+document.getElementById("loginput").addEventListener('change', parser, false);
+document.getElementById("depinput").addEventListener('change', buildDep, false);
+
+</script>
+
+</head>
+<body>
+
+</body>
+</html>
